@@ -1,0 +1,11 @@
+__pycache__/
+config.json
+data/
+alps-root.crt
+.aws
+.agents/
+.codex/
+.env
+*.key
+*.pem
+.playwright-mcp/

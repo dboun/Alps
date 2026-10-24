@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#e8eceb" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1c2428" media="(prefers-color-scheme: dark)">
+  <title>Alps</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="alps-shell" content="/shell.js?v=1">
+  <link rel="stylesheet" href="/style.css?v=15">
+  <script src="/app.js?v=13" defer></script>
+</head>
+<body>
+  <svg class="landscape" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMax slice" aria-hidden="true">
+    <defs>
+      <linearGradient id="sky" x2="0" y2="1"><stop class="sky-top"/><stop offset="1" class="sky-bottom"/></linearGradient>
+      <linearGradient id="water" x1="0" y1="0" x2=".6" y2="1"><stop class="water-top"/><stop offset="1" class="water-bottom"/></linearGradient>
+      <linearGradient id="mist" x2="0" y2="1"><stop class="mist-top"/><stop offset="1" class="mist-bottom"/></linearGradient>
+    </defs>
+    <path fill="url(#sky)" d="M0 0H1600V1000H0Z"/>
+    <circle class="sun" cx="1210" cy="300" r="60"/>
+    <path class="distant" d="M0 600 140 475 240 530 440 342 560 431 720 268 840 405 930 350 1110 489 1295 327 1430 430 1600 370V1000H0Z"/>
+    <path class="ridge-back" d="m0 620 182-112 142 45 230-271 93 124 75-138 169 270 101-64 145 166 140-159 143 74 180-99v544H0Z"/>
+    <path class="snow" d="m424 437 130-155 93 124 75-138 110 176-93-89-24 61-38-39-30 71-91-107-39 85-33-17Z"/>
+    <path class="rock-light" d="m554 282 25 169-38 147-157 107-82-41Z"/>
+    <path class="rock-dark" d="m554 282 93 124 75-138-49 240 92 147-224-57 38-147Z"/>
+    <path class="snow-shadow" d="m554 282 25 169 29-65 39 62 30-71 38 39 24-61-17-87-75 138Z"/>
+    <path class="ridge-middle" d="M0 746 162 603 311 670 457 558 674 690 832 657 984 744 1206 555 1344 623 1498 520 1600 584V1000H0Z"/>
+    <path class="ridge-middle-light" d="m0 746 162-143 149 67 146-112-97 197-189 87L0 893Z"/>
+    <path class="valley" d="m0 876 230-83 253-22 180-52 169-62 152 87 160 24 228 109 228 70v53H0Z"/>
+    <path class="meadow" d="m832 657-169 62-180 52-253 22L0 876v124h651l240-120-126-66 114-87Z"/>
+    <path fill="url(#water)" d="m832 657-13 57 34 29-104 64 150 68-311 125h279l151-129-184-70 50-59-38-30Z"/>
+    <path class="river-shine" d="m832 657-6 58 36 28-96 65 156 65-247 127h52l226-128-171-65 93-66-40-29Z"/>
+    <path class="foreground" d="M0 947 210 883 377 910 500 875 669 916 519 1000H0Zm1600-115-153-10-114 58-164 19-181 101h612Z"/>
+    <path class="contour" d="m0 915 231-91 220-10 182-48m-525 181 150-48 167 6m1175 18-178-9-157 55m-209-228 127 60 194 47"/>
+    <path fill="url(#mist)" d="M0 0H1600V710H0Z"/>
+  </svg>
+
+  <header class="topbar">
+    <a href="/" class="wordmark" aria-label="Alps home"><svg viewBox="0 0 36 28" aria-hidden="true"><path d="m2 24 11-19 6 10 4-7 11 16M9 12l4 3 3-3M20 14l3 2 3-2"/></svg><span>Alps</span></a>
+    <div class="top-actions"><button id="signout" class="quiet" hidden>Sign out</button></div>
+  </header>
+
+  <main>
+    <section id="login-view" class="login-view" hidden>
+      <div class="intro"><p class="eyebrow">A place to start</p><h1>Welcome home.</h1><p class="subtitle">Your apps are just over the ridge.</p></div>
+      <form id="login-form" class="login-card">
+        <h2>Sign in to Alps</h2>
+        <label for="username">Username</label><input id="username" name="username" autocomplete="username" required maxlength="80">
+        <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
+        <p id="login-error" class="error" role="alert"></p>
+        <button class="primary" type="submit">Sign in <span aria-hidden="true">↗</span></button>
+        <button id="forget-device" class="quiet forget-device" type="button" hidden>Forget this device</button>
+      </form>
+    </section>
+
+    <section id="apps-view" hidden>
+      <div class="intro"><h1>Everything starts here.</h1></div>
+      <div class="apps-toolbar">
+        <div class="collection-heading"><h2>Your apps</h2><span id="app-count" class="count">0</span><button id="toggle-edit" class="collection-edit" type="button" aria-pressed="false" aria-controls="apps-grid"><svg class="edit-pencil" viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5 4 4M4 20l5-1L20 8a2.8 2.8 0 0 0-4-4L5 15l-1 5Z"/></svg><svg class="edit-close" viewBox="0 0 24 24" aria-hidden="true" hidden><path d="m6 6 12 12M18 6 6 18"/></svg><span>Edit</span></button></div>
+        <div class="collection-actions"><label class="search-box"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="search" type="search" placeholder="Find an app" aria-label="Find an app"><button id="clear-search" class="clear-search" type="button" aria-label="Clear search" hidden>&times;</button></label><button id="add-app" class="primary"><span aria-hidden="true">+</span> Add app</button></div>
+      </div>
+      <p class="reorder-hint" id="reorder-hint" hidden>Drag apps to any spot. On touchscreens, use the move handle.</p>
+      <div id="apps-grid" class="apps-grid"></div>
+      <div id="empty" class="empty" hidden><svg viewBox="0 0 64 64" aria-hidden="true"><path d="m6 48 19-32 12 20 8-14 14 26M19 27l6 5 5-4M37 36v19m-5-5 5 5 5-5"/></svg><h3>A home for your apps.</h3><p>Add a name and an address to get started.</p><button id="empty-add" class="primary">Add your first app <span aria-hidden="true">+</span></button></div>
+      <div id="no-results" class="no-results" hidden><p>No apps match.</p><a id="web-search" class="web-search" target="_blank" rel="noopener noreferrer">Search the web ↗</a></div>
+    </section>
+    <p id="loading" class="loading" role="status">Finding your way home…</p>
+    <p id="page-error" class="page-error error" role="alert" hidden></p>
+  </main>
+
+  <footer><span class="footer-mark">△</span><span>From here, anywhere.</span></footer>
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <dialog id="editor" aria-labelledby="editor-title">
+    <form id="app-form">
+      <div class="dialog-heading"><div><p class="eyebrow">Your collection</p><h2 id="editor-title">Add an app</h2></div><button id="close-editor" class="icon-button" type="button" aria-label="Close">×</button></div>
+      <aside class="localhost-notice" aria-labelledby="localhost-title"><strong id="localhost-title">App only listens on localhost?</strong><p>Run this command (replace port and name) in a terminal to make the app available over HTTPS, protected by your Alps login:</p><code>alps expose http://127.0.0.1:3000 --name Notebook</code></aside>
+      <label for="app-name">Name</label><input id="app-name" name="name" placeholder="App name" maxlength="80" required autocomplete="off">
+      <label for="app-url">Address</label><input id="app-url" name="url" placeholder="http://hostname:port" required maxlength="2048" inputmode="url" autocomplete="off" spellcheck="false" aria-describedby="address-hint address-protocol">
+      <div id="address-completions" class="address-completions" aria-label="Address suggestions" hidden></div>
+      <p id="address-hint" class="field-hint" hidden>This computer: <code id="address-ip"></code>. Press Tab or tap the suggestion to complete.</p>
+      <p id="address-protocol" class="field-hint">Use HTTP unless the app itself has HTTPS configured. Include its port or path if needed.</p>
+      <p id="proxy-hint" class="field-hint" hidden>This HTTPS address is managed by the Alps CLI.</p>
+      <label for="app-icon">Icon <span class="optional">optional</span></label><input id="app-icon" name="icon_path" placeholder="~/Pictures/app.svg" maxlength="4096" autocomplete="off" spellcheck="false"><p class="field-hint">An image path on this computer; ~ means your home folder. Otherwise Alps looks for the app’s favicon.</p>
+      <div id="icon-preview" class="icon-preview" hidden><img id="suggested-icon" alt="App icon"><button id="clear-icon" class="quiet" type="button">Remove icon</button></div>
+      <p id="save-error" class="error" role="alert"></p>
+      <div id="remove-confirm" class="remove-confirm" hidden><p>Remove this app from Alps? The app itself stays as it is.</p><div><button id="cancel-remove" type="button" class="quiet">Keep app</button><button id="confirm-remove" type="button" class="danger">Remove app</button></div></div>
+      <div class="dialog-footer"><button id="remove-app" type="button" class="danger-text" hidden>Remove app</button><button id="save-app" class="primary" type="submit">Add app <span aria-hidden="true">↗</span></button></div>
+    </form>
+  </dialog>
+  <dialog id="signout-dialog" aria-labelledby="signout-title">
+    <form method="dialog">
+      <div class="dialog-heading"><h2 id="signout-title">Sign out?</h2><button class="icon-button" value="" aria-label="Close">×</button></div>
+      <p class="field-hint">Remembering fills in your username next time and keeps this browser trusted for sign-in attempts. Forget on a shared computer.</p>
+      <div class="signout-choices"><button value="remember" class="primary">Sign out and remember username and device</button><button value="forget" class="quiet">Sign out and forget username and device</button></div>
+    </form>
+  </dialog>
+</body>
+</html>
