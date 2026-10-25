@@ -109,7 +109,7 @@ def apply(config, data, rows, icon_overrides=None):
             if not slug:
                 result.append(app)
             elif slug in by_slug:
-                app.update(url=gateway.public_url(config, by_slug[slug]), name=by_slug[slug]['name'])
+                app.update(url=gateway.public_url(config, by_slug[slug]))
                 result.append(app); seen.add(slug)
         for row in rows:
             if row['slug'] not in seen:

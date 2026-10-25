@@ -173,6 +173,32 @@ class AlpsTests(unittest.TestCase):
             cli.apply(self.config,self.folder,[])
         self.assertEqual(json.loads(self.request('/api/apps')[2]),[])
 
+    def test_proxy_rename_survives_cli_updates(self):
+        self.config.update(address='192.168.1.42', url='https://192.168.1.42')
+        row = dict(slug='feedback', name='Feedback', port=18443, upstream='http://127.0.0.1:3000')
+        with patch.object(cli, 'reload_caddy'):
+            cli.apply(self.config, self.folder, [row])
+            self.login()
+            saved = json.loads(self.request('/api/apps')[2])[0]
+            self.assertEqual(saved['name'], 'Feedback')
+            status, _, payload = self.request('/api/apps/save', dict(saved, name='signoff'))
+            self.assertEqual(status, 200)
+            renamed = json.loads(payload)[0]
+            # Both apply and expose use this transaction, including for unrelated apps.
+            other = dict(slug='other', name='Other', port=18444, upstream='http://127.0.0.1:3001')
+            self.config['address'] = '192.168.1.43'
+            for rows in ([row], [row, other], [row]):
+                cli.apply(self.config, self.folder, rows)
+                expected = dict(renamed, url='https://192.168.1.43:18443')
+                self.assertEqual(json.loads(self.request('/api/apps')[2])[0], expected)
+                self.assertEqual(app.load_apps(self.folder)[0], expected)
+            restarted = app.AlpsServer(('127.0.0.1', 0), self.config, self.folder)
+            try:
+                self.assertEqual(restarted.apps[0], expected)
+            finally:
+                restarted.server_close()
+            self.assertEqual(gateway.read_exposed(self.folder), [row])
+
     def test_host_csrf_and_rate_limit(self):
         self.assertEqual(self.request('/', headers={'Host': 'attacker.test'})[0], 403)
         self.assertEqual(self.request('/api/login', {}, {'X-Alps': ''})[0], 403)

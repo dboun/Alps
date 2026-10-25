@@ -22,6 +22,8 @@ alps expose http://127.0.0.1:3000 --name Notebook --port 18444 --icon '~/Picture
 
 Repeat with the same name to change its upstream or settings. Its URL stays on the same
 HTTPS port unless you pass a different `--port`. Names produce slugs such as `car-search`.
+Renaming a tile in the launcher persists when routes are reapplied or settings change.
+Its CLI slug stays the same; use the original `--name` when updating its exposure.
 
 ```sh
 alps list
@@ -29,7 +31,7 @@ alps unexpose notebook
 ```
 
 `unexpose` removes both the proxy route and the tile. It leaves the original app running.
-Proxy addresses and removal are managed in the CLI; icons and app order can be changed in the launcher.
+Proxy addresses and removal are managed in the CLI; names, icons and app order can be changed in the launcher.
 If the Alps computer's IP changes, update Alps setup and run `alps apply` to update the proxy addresses.
 Also run `alps apply` after updating Alps, so the proxy routes pick up any security fixes.
 
