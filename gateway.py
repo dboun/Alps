@@ -69,7 +69,8 @@ def site_block(address, binds, private, body, sources=None):
 
 
 def public_url(config, row):
-    return f'https://{config["address"]}:{row["port"]}'
+    # The Tailscale name works on every network and has a trusted certificate.
+    return f'https://{config.get("tailscale_name") or config["address"]}:{row["port"]}'
 
 
 def caddy_blocks(config, rows):

@@ -9,11 +9,12 @@ from pathlib import Path
 import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
-from app import ROOT, password_hash, write_json
+from app import ROOT, apps_lock, load_apps, password_hash, write_json
 import gateway
 
 CADDYFILE = Path('/etc/caddy/Caddyfile')
@@ -23,6 +24,16 @@ MARKER = '# Managed by Alps'
 FIREWALL = Path('/etc/alps/firewall.nft')
 FIREWALL_UNIT = Path('/etc/systemd/system/alps-firewall.service')
 CADDY_DROPIN = Path('/etc/systemd/system/caddy.service.d/alps.conf')
+NFTABLES_DROPIN = Path('/etc/systemd/system/nftables.service.d/alps.conf')
+FIREWALL_CHECK = Path('/etc/alps/firewall-check')
+CHECK_UNIT = Path('/etc/systemd/system/alps-firewall-check.service')
+CHECK_TIMER = Path('/etc/systemd/system/alps-firewall-check.timer')
+UFW = Path('/usr/sbin/ufw')
+CHECK_PATH = 'PATH=/usr/sbin:/usr/bin:/sbin:/bin'  # This runs as root, so no /usr/local.
+ADMIN = 'admin unix//run/caddy/admin.sock'
+GLOBAL_OPTIONS = re.compile(r'(?:[ \t]*(?:#[^\n]*)?\r?\n)*\{[ \t]*(?:#[^\n]*)?\r?\n((?s:.*?))^\}', re.M)
+# The welcome site from Caddy's package, comments allowed. It listens on every network.
+DEFAULT_SITE = re.compile(r'^:80 \{\n(?:[ \t]*(?:#.*)?\n|[ \t]*root \* /usr/share/caddy\n|[ \t]*file_server\n)*\}\n?', re.M)
 TAILSCALE_DEFAULTS = Path('/etc/default/tailscaled')
 TAILSCALE_NET = ipaddress.IPv4Network('100.64.0.0/10')
 TAILSCALE_STEPS = '''
@@ -169,6 +180,7 @@ def collect(old):
     print('  lan      your home network')
     print('  lan+ips  your home network and chosen addresses, such as Tailscale')
     print('  ips      only chosen addresses, such as Tailscale; the home network cannot connect')
+    print('On a laptop, choose ips: Caddy cannot start while a chosen address is missing, such as a home address away from home.')
     access = select('Access', ['local', 'lan', 'lan+ips', 'ips'], old.get('access') or ('local' if old.get('bind') == '127.0.0.1' else 'lan'))
     bind = '127.0.0.1' if access == 'local' else '0.0.0.0'
     lan, extra, tailscale = '', [], {}
@@ -282,36 +294,86 @@ def pinned_addresses(config):
     return pinned
 
 
-def firewall_text(config):
+def all_pinned(config, old=None):
+    """While changing setup, old addresses stay protected too: a rollback brings their listeners back."""
+    pinned = pinned_addresses(config)
+    try:
+        previous = pinned_addresses(gateway.checked(old or {}))
+    except (KeyError, StopIteration, ValueError):  # A hand-edited config must not block fixing it with change.
+        previous = []
+    # One rule per address: two rules for different interfaces would block both.
+    return pinned + [item for item in previous if item[0] not in [ip for ip, _ in pinned]]
+
+
+def firewall_text(config, old=None):
     # Linux accepts traffic for any of its addresses on any interface. Without this, a LAN device
     # could route packets for the Tailscale address to this computer's Wi-Fi and reach Alps.
     rules = ''.join(f'\t\t{"ip6" if ":" in ip else "ip"} daddr {ip} iifname != {{ "lo", "{interface}" }} drop\n'
-                    for ip, interface in pinned_addresses(config))
+                    for ip, interface in all_pinned(config, old))
     if not rules:
         return ''
     return (f'#!/usr/sbin/nft -f\n{MARKER}\ntable inet alps\ndelete table inet alps\ntable inet alps {{\n'
             '\tchain input {\n\t\ttype filter hook input priority filter - 5; policy accept;\n' + rules + '\t}\n}\n')
 
 
-def configure_firewall(config):
-    text = firewall_text(config)
-    if not text:
-        if FIREWALL_UNIT.exists():
-            # Drop Caddy's dependency first, or stopping the rule would stop Caddy too.
-            if CADDY_DROPIN.exists():
-                install_system_file(CADDY_DROPIN, caddy_boot(config))
-                run(['sudo', 'systemctl', 'daemon-reload'])
-            run(['sudo', 'systemctl', 'disable', '--now', FIREWALL_UNIT.name])
-            run(['sudo', 'rm', '-f', str(FIREWALL_UNIT), str(FIREWALL)])
-            run(['sudo', 'systemctl', 'daemon-reload'])
+def nftables_dropin(nft):
+    # Starting or reloading nftables flushes the rule without stopping Caddy, so restore it right after.
+    return f'{MARKER}\n[Service]\nExecStartPost={nft} -f {FIREWALL}\nExecReload={nft} -f {FIREWALL}\n'
+
+
+def firewall_check(nft, repair_ufw=False):
+    """Runs as root every 30 seconds. A flush leaves Caddy running, so without the rule Caddy must stop."""
+    # ufw-init is what ufw.service runs. Unlike ufw reload, it never rewrites ENABLED, so being killed can't turn ufw off.
+    ufw = ('if grep -qsx ENABLED=yes /etc/ufw/ufw.conf && ! iptables -w 5 -n -L ufw-user-input >/dev/null 2>&1; then\n'
+           '\techo "ufw rules were missing. Restoring them."\n\t/usr/lib/ufw/ufw-init start quiet || status=1\nfi\n') if repair_ufw else ''
+    # Stopping the rule's service too makes a later Caddy start load the rule, or fail.
+    return (f'#!/bin/sh\n{MARKER}\n{CHECK_PATH}\nstatus=0\n'
+            f'if ! {nft} list chain inet alps input 2>/dev/null | grep -q " drop"; then\n'
+            f'\techo "Alps firewall rule was missing. Restoring it."\n\tif ! {nft} -f {FIREWALL}; then\n'
+            '\t\techo "Could not restore the Alps firewall rule. Stopping Caddy."\n'
+            '\t\tsystemctl stop caddy alps-firewall.service\n\t\tstatus=1\n\tfi\nfi\n'
+            f'{ufw}exit $status\n')
+
+
+def install_firewall_check(nft, repair_ufw):
+    install_system_file(FIREWALL_CHECK, firewall_check(nft, repair_ufw), mode='755')
+    # Warnings only: this runs too often to log every pass.
+    install_system_file(CHECK_UNIT, '[Unit]\nDescription=Alps: keep the firewall rule loaded\n\n[Service]\nType=oneshot\n'
+                        f'ExecStart={FIREWALL_CHECK}\nTimeoutStartSec=60\nSyslogLevel=warning\nLogLevelMax=warning\n')
+    install_system_file(CHECK_TIMER, '[Unit]\nDescription=Alps: check the firewall rule every 30 seconds\n\n'
+                        '[Timer]\nOnActiveSec=30\nOnUnitActiveSec=30\nAccuracySec=5\n\n[Install]\nWantedBy=timers.target\n')
+
+
+def remove_firewall(config):
+    """Runs last: until Caddy and Alps are on the new setup, the old listeners may still need the rule."""
+    if firewall_text(config) or not (FIREWALL_UNIT.exists() or NFTABLES_DROPIN.exists() or CHECK_TIMER.exists()):
         return
-    nft = shutil.which('nft') or '/usr/sbin/nft'
-    if not Path(nft).exists():
+    # Drop Caddy's dependency first, or stopping the rule would stop Caddy too.
+    if CADDY_DROPIN.exists():
+        install_system_file(CADDY_DROPIN, caddy_boot(config))
+        run(['sudo', 'systemctl', 'daemon-reload'])
+    if CHECK_TIMER.exists():  # Before the rule goes, or the check would restore it or stop Caddy.
+        run(['sudo', 'systemctl', 'disable', '--now', CHECK_TIMER.name])
+        run(['sudo', 'systemctl', 'stop', CHECK_UNIT.name])  # Waits for a check that already started.
+    if FIREWALL_UNIT.exists():
+        run(['sudo', 'systemctl', 'disable', '--now', FIREWALL_UNIT.name])
+    run(['sudo', 'rm', '-f', str(FIREWALL_UNIT), str(FIREWALL), str(NFTABLES_DROPIN), str(FIREWALL_CHECK), str(CHECK_UNIT), str(CHECK_TIMER)])
+    run(['sudo', 'systemctl', 'daemon-reload'])
+
+
+def configure_firewall(config, old=None):
+    text = firewall_text(config, old)
+    if not text:
+        return
+    # A fixed path: this runs as root, and PATH can point into folders the user can write to.
+    nft = next((path for path in ('/usr/sbin/nft', '/sbin/nft') if Path(path).exists()), None)
+    if not nft:
         raise ValueError('Chosen addresses need nftables for their firewall rule. Run: sudo apt install nftables')
-    if previous := read_system(FIREWALL):
-        if not previous.startswith('#!/usr/sbin/nft -f\n' + MARKER):
-            raise ValueError(f'{FIREWALL} is not managed by Alps. Move it before continuing.')
-    print('Adding a firewall rule so chosen addresses only accept traffic from their own network (needs sudo).')
+    previous = read_system(FIREWALL)
+    if previous and not previous.startswith('#!/usr/sbin/nft -f\n' + MARKER):
+        raise ValueError(f'{FIREWALL} is not managed by Alps. Move it before continuing.')
+    if previous != text:
+        print('Adding a firewall rule so chosen addresses only accept traffic from their own network (needs sudo).')
     install_system_file(FIREWALL, text, lambda path: run(['sudo', nft, '-c', '-f', str(path)]))
     unit = ('[Unit]\nDescription=Alps: chosen addresses accept traffic only from their own network\n'
             'DefaultDependencies=no\nWants=network-pre.target\nBefore=network-pre.target caddy.service shutdown.target\n'
@@ -320,9 +382,12 @@ def configure_firewall(config):
             f'ExecStart={nft} -f {FIREWALL}\nExecReload={nft} -f {FIREWALL}\nExecStop={nft} delete table inet alps\n\n'
             '[Install]\nWantedBy=sysinit.target\n')
     install_system_file(FIREWALL_UNIT, unit)
+    install_system_file(NFTABLES_DROPIN, nftables_dropin(nft))
+    install_firewall_check(nft, config.get('repair_ufw'))
     run(['sudo', 'systemctl', 'daemon-reload'])
     run(['sudo', 'systemctl', 'enable', FIREWALL_UNIT.name])
     run(['sudo', 'systemctl', 'reload-or-restart', FIREWALL_UNIT.name])
+    run(['sudo', 'systemctl', 'enable', '--now', CHECK_TIMER.name])
 
 
 def allow_tailscale_certificates():
@@ -349,13 +414,49 @@ def allow_tailscale_certificates():
         time.sleep(1)
 
 
-def caddy_boot(config):
+def caddy_boot(config, old=None):
     # Caddy listens on specific addresses; Tailscale's may appear after Caddy starts.
-    firewall = 'Requires=alps-firewall.service\nAfter=alps-firewall.service\n' if pinned_addresses(config) else ''
-    return f'# Managed by Alps\n[Unit]\nAfter=tailscaled.service\n{firewall}\n[Service]\nRestart=on-failure\nRestartSec=5\n'
+    firewall = 'Requires=alps-firewall.service\nAfter=alps-firewall.service\n' if all_pinned(config, old) else ''
+    return (f'# Managed by Alps\n[Unit]\nAfter=tailscaled.service\n{firewall}\n[Service]\nRestart=on-failure\nRestartSec=5\n'
+            # Holds the admin socket; only the caddy user can enter it.
+            'RuntimeDirectory=caddy\nRuntimeDirectoryMode=0700\n')
 
 
-def configure_caddy(config):
+def private_admin(main):
+    """Caddy's admin API has no password, so keep it off TCP, where any local process or app could rewrite the routes."""
+    options = GLOBAL_OPTIONS.match(main)
+    if options:
+        current = re.search(r'^[ \t]*(admin\b.*?)[ \t]*\r?$', options[1], re.M)
+        if not current:
+            return main[:options.start(1)] + f'\t{ADMIN}\n' + main[options.start(1):]
+        if current[1] != ADMIN:
+            print(f'{CADDYFILE} sets its own Caddy admin address, so Alps left it unchanged.')
+        return main
+    # Global options must come first and exist once, and an import can hold them.
+    first = next((line.strip() for line in main.splitlines() if line.strip() and not line.strip().startswith('#')), '')
+    if (first.startswith('{') and not first.startswith('{$')) or (first.split()[:1] == ['import'] and first != IMPORT) \
+            or re.search(r'^[ \t]*\{[ \t]*(#.*)?\r?$', main, re.M):
+        print(f'Warning: Alps could not edit the global options in {CADDYFILE}. Caddy admin stays on TCP. Add this to them: {ADMIN}')
+        return main
+    return f'{{\n\t{ADMIN}\n}}\n\n' + main
+
+
+def without_default_site(main):
+    match = DEFAULT_SITE.search(main)
+    if match and yes('Caddy\'s default welcome page listens on port 80 on every network, including public Wi-Fi. Remove it?'):
+        main = main[:match.start()] + main[match.end():]
+    return main
+
+
+def open_listeners(adapted):
+    """Caddy listen addresses without a specific IP, from `caddy adapt` output. Any site without bind has one."""
+    servers = json.loads(adapted or '{}').get('apps', {}).get('http', {}).get('servers', {})
+    listens = {address for server in servers.values() for address in server.get('listen', [])}
+    return sorted(address for address in listens if address.split('/')[-1].rsplit(':', 1)[0].strip('[]') in ('', '*', '0.0.0.0', '::'))
+
+
+def caddy_plan(config):
+    """(Caddyfile, snippet) to install, or None. Holds Caddy's questions, so a no leaves the system untouched."""
     current = read_system(CADDYFILE)
     previous = read_system(SNIPPET)
     if previous and not previous.startswith(MARKER):
@@ -367,13 +468,32 @@ def configure_caddy(config):
             raise SystemExit('Caddy was not changed.')
         new_snippet = caddy_text(config)
         new_main = current if IMPORT in [line.strip() for line in current.splitlines()] else current.rstrip() + '\n\n' + IMPORT + '\n'
+        new_main = private_admin(without_default_site(new_main))
     elif previous and IMPORT in [line.strip() for line in current.splitlines()]:
         if not yes('Switching to HTTP. Disable the existing Alps HTTPS site, keeping other Caddy sites?'):
             raise SystemExit('Setup cancelled. Existing HTTPS was kept.')
         new_main = '\n'.join(line for line in current.splitlines() if line.strip() != IMPORT) + '\n'
         new_snippet = ''
     else:
-        return
+        return None
+    return new_main, new_snippet
+
+
+def warn_open_sites():
+    """Only a warning, and Caddy already restarted, so a failure here must not stop setup."""
+    try:
+        adapted = run(['sudo', 'caddy', 'adapt', '--config', str(CADDYFILE), '--adapter', 'caddyfile'], capture_output=True, text=True).stdout
+        for address in open_listeners(adapted):
+            print(f'Warning: Caddy listens on {address} on every network. Add bind to that site, or remove it.')
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        print('Could not check Caddy for sites on every network.')
+
+
+def configure_caddy(config, plan=None, old=None):
+    plan = plan or caddy_plan(config)
+    if not plan:
+        return None
+    new_main, new_snippet = plan
     print('Caddy changes need sudo. Existing files will be backed up.')
     stamp = str(time.time_ns())
     backups = {CADDYFILE: None, SNIPPET: None}
@@ -393,7 +513,7 @@ def configure_caddy(config):
             run(['sudo', 'install', '-m', '644', str(main), str(CADDYFILE)])
             run(['sudo', 'caddy', 'validate', '--config', str(CADDYFILE), '--adapter', 'caddyfile'])
             if config['https']:
-                install_system_file(CADDY_DROPIN, caddy_boot(config))
+                install_system_file(CADDY_DROPIN, caddy_boot(config, old))
                 run(['sudo', 'systemctl', 'daemon-reload'])
             run(['sudo', 'systemctl', 'enable', 'caddy'])
             # A reload cannot move a listener from all addresses to one address; restart instead.
@@ -401,8 +521,9 @@ def configure_caddy(config):
     except (OSError, subprocess.CalledProcessError):
         print('Caddy could not apply Alps. Restoring the previous Caddy files.')
         restore_caddy(backups)
-        print('Port 443 may already belong to another site or server. Check: sudo journalctl -u caddy -n 40')
+        print('The Caddyfile may have an error, or port 443 may belong to another server. Check: sudo journalctl -u caddy -n 40')
         raise
+    warn_open_sites()
     for backup in backups.values():
         if backup:
             print('Backup: ' + backup)
@@ -419,6 +540,31 @@ def service_text():
             '[Install]\nWantedBy=default.target\n')
 
 
+def listening(port):
+    try:
+        socket.create_connection(('127.0.0.1', port), timeout=1).close()
+        return True
+    except OSError:
+        return False
+
+
+def narrowed(old, config):
+    """An address stopped being served, so sessions from it should not outlive the change."""
+    return bool(old.get('https')) and bool(set(gateway.hosts(old)) - set(gateway.hosts(config)) - {'127.0.0.1'})
+
+
+def refresh_tiles(config, data):
+    """Point saved tiles at the current address. Alps reads them at start, so run this while it is stopped."""
+    rows = {row['slug']: row for row in gateway.read_exposed(data)}
+    if rows:
+        with apps_lock(data):
+            apps = load_apps(data)
+            for app in apps:
+                if app.get('proxy') in rows:
+                    app['url'] = gateway.public_url(config, rows[app['proxy']])
+            write_json(Path(data) / 'apps.json', apps)
+
+
 def print_access(config):
     print('\nOpen ' + config['url'])
     if config['https']:
@@ -432,7 +578,12 @@ def print_access(config):
             print('Reserve this computer\'s LAN IP in your router. Do not enable router port forwarding.')
         if config.get('access') == 'ips':
             print('Devices on your home network cannot connect; only the chosen addresses above work.')
-        print('If your firewall is on, allow TCP port ' + ('443 (and 80 for HTTP redirects)' if config['https'] else str(config['port'])) + ' on the chosen networks.')
+        if any(ipaddress.ip_address(item['ip']) in TAILSCALE_NET for item in config.get('extra', [])):
+            print('If your firewall is on, allow Alps on Tailscale only:')
+            print('  sudo ufw allow in on tailscale0 to any port 443 proto tcp')
+            print('  sudo ufw allow in on tailscale0 to any port 18443:19443 proto tcp')
+        if config.get('lan') or 'access' not in config:
+            print('If your firewall is on, allow TCP 443 and 80 and the ports of exposed apps from the home network only.')
     if config['https']:
         certificate = '/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt'
         print('\nFor the IP addresses, Caddy creates a private certificate; no public certificate or domain is needed.')
@@ -488,36 +639,51 @@ def main():
     if not config['https'] and gateway.read_exposed(ROOT / 'data'):
         raise ValueError('Remove exposed apps with alps unexpose before switching Alps to HTTP.')
     print('\nWill serve ' + config['url'] + ' as ' + config['username'] + '.')
+    signout = narrowed(old, config) and yes('Some addresses are no longer served. Sign out every device, so old sign-ins stop working?')
+    was_active = subprocess.run(['systemctl', '--user', 'is-active', '--quiet', 'alps.service']).returncode == 0
+    if signout and not was_active and listening(old.get('port', 8020)):  # It would write its sessions back.
+        raise ValueError('Alps is running outside its service. Stop it first, then run ./install.sh again.')
     unit_folder = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'systemd/user'
     unit_folder.mkdir(parents=True, exist_ok=True)
     unit = unit_folder / 'alps.service'
     if unit.exists() and 'Description=Alps home launcher' not in unit.read_text():
         raise SystemExit(f'{unit} belongs to another service. Rename that service before installing Alps.')
+    if 'repair_ufw' in old:
+        config['repair_ufw'] = old['repair_ufw']
+    elif firewall_text(config) and UFW.exists():
+        config['repair_ufw'] = yes('Also restore ufw if its rules get wiped? It does nothing while ufw is off.')
+    plan = caddy_plan(config)
     if config['https']:
         # The rule must exist before Caddy listens on the chosen addresses.
-        configure_firewall(config)
+        configure_firewall(config, old)
         if config.get('tailscale_name'):
             allow_tailscale_certificates()
     # Caddy validates and restores on failure before changing the app credentials/service.
-    caddy_backups = configure_caddy(config)
-    was_active = subprocess.run(['systemctl', '--user', 'is-active', '--quiet', 'alps.service']).returncode == 0
-    if was_active:
-        run(['systemctl', '--user', 'stop', 'alps.service'])
+    caddy_backups = configure_caddy(config, plan, old)
+    # Also stops a service waiting to restart; it does not exist yet on a first install.
+    subprocess.run(['systemctl', '--user', 'stop', 'alps.service'], check=was_active, stderr=subprocess.DEVNULL)
     previous_config = path.read_bytes() if path.exists() else None
     previous_unit = unit.read_bytes() if unit.exists() else None
+    tiles = ROOT / 'data/apps.json'
+    previous_tiles = tiles.read_bytes() if tiles.exists() else None
     try:
         write_json(path, config)
+        refresh_tiles(config, ROOT / 'data')
+        if signout:
+            (ROOT / 'data/sessions.json').unlink(missing_ok=True)
         unit.write_text(service_text())
         run(['systemctl', '--user', 'daemon-reload'])
         run(['systemctl', '--user', 'enable', '--now', 'alps.service'])
         time.sleep(.6)
         run(['systemctl', '--user', 'is-active', '--quiet', 'alps.service'])
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, ValueError, subprocess.CalledProcessError):
         print('Alps could not start. Restoring its previous settings. Check journalctl --user -u alps.service -n 30')
         if previous_config is not None:
             path.write_bytes(previous_config)
         else:
             path.unlink(missing_ok=True)
+        if previous_tiles is not None:
+            tiles.write_bytes(previous_tiles)
         if previous_unit is not None:
             unit.write_bytes(previous_unit)
         else:
@@ -529,6 +695,9 @@ def main():
         if caddy_backups:
             restore_caddy(caddy_backups)
         raise
+    if config['https']:
+        configure_firewall(config)  # Everything works, so old addresses can leave the rule.
+        remove_firewall(config)
     linger = subprocess.run(['loginctl', 'show-user', getpass.getuser(), '-p', 'Linger', '--value'], capture_output=True, text=True) if shutil.which('loginctl') else None
     if linger and linger.stdout.strip() != 'yes':
         if yes('Start Alps at boot, even before you log in?'):

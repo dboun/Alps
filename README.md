@@ -16,7 +16,11 @@ Choose `local` for this computer only, or `lan` for your home network, then set 
 username and password. Setup prints the address to open. HTTPS uses port `443`;
 local HTTP uses `8020` by default.
 
-For `ips` / `lan+ips` access, see [network setup](docs/SETUP.md#who-can-connect).
+On a laptop, choose `ips` with Tailscale. Your apps then work from any network, and
+they stay closed to whatever Wi-Fi you're on. Keep Tailscale running, and turn on a
+firewall too, because Alps can't protect other apps on the laptop. See
+[network setup](docs/SETUP.md#who-can-connect) for the commands and for `lan+ips`.
+
 For Tailscale with a trusted certificate, see [Tailscale HTTPS](docs/HTTPS.md#tailscale-name-with-a-trusted-certificate).
 
 Run the installer again to update or change setup. Your apps stay saved.

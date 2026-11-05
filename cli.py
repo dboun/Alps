@@ -164,11 +164,8 @@ def main(argv=None):
             if active:
                 setup.run(['systemctl', '--user', 'stop', 'alps.service'])
             else:
-                try:
-                    socket.create_connection(('127.0.0.1', config['port']), timeout=1).close()
+                if setup.listening(config['port']):
                     raise ValueError('Alps is running outside its service. Stop it first, then run this again.')
-                except OSError:
-                    pass
             (data / 'sessions.json').unlink(missing_ok=True)
             if active:
                 setup.run(['systemctl', '--user', 'start', 'alps.service'])

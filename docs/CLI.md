@@ -32,7 +32,7 @@ alps unexpose notebook
 
 `unexpose` removes both the proxy route and the tile. It leaves the original app running.
 Proxy addresses and removal are managed in the CLI; names, icons and app order can be changed in the launcher.
-If the Alps computer's IP changes, update Alps setup and run `alps apply` to update the proxy addresses.
+If the Alps computer's IP changes, rerun `./install.sh`, choose `change`, and it also updates the proxy addresses.
 Also run `alps apply` after updating Alps, so the proxy routes pick up any security fixes.
 
 The CLI asks for sudo to validate and reload Caddy. It changes only Alps' managed Caddy

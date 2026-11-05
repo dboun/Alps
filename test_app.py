@@ -456,6 +456,135 @@ class SetupTests(unittest.TestCase):
                 self.assertNotIn(setup.IMPORT, main.read_text())
                 self.assertIn(original.rstrip(), main.read_text())
 
+    def test_caddy_hardening(self):
+        welcome = '# Comment\n\n:80 {\n\t# Site root.\n\troot * /usr/share/caddy\n\n\tfile_server\n\n\t# reverse_proxy localhost:8080\n}\n\nimport x\n'
+        with patch.object(setup, 'yes', return_value=True):
+            self.assertEqual(setup.without_default_site(welcome), '# Comment\n\n\nimport x\n')
+        with patch.object(setup, 'yes', return_value=False):
+            self.assertEqual(setup.without_default_site(welcome), welcome)
+        custom = ':80 {\n\treverse_proxy localhost:8080\n}\n'
+        with patch.object(setup, 'yes') as asked:
+            self.assertEqual(setup.without_default_site(custom), custom)
+        asked.assert_not_called()
+        adapted = json.dumps(dict(apps=dict(http=dict(servers=dict(
+            a=dict(listen=[':443', '100.70.0.5:443', '[fd7a::5]:443']), b=dict(listen=['tcp/:80', '0.0.0.0:81', '[::]:82', '127.0.0.1:443']))))))
+        self.assertEqual(setup.open_listeners(adapted), ['0.0.0.0:81', ':443', '[::]:82', 'tcp/:80'])
+        self.assertEqual(setup.open_listeners(None), [])
+        self.assertTrue(setup.private_admin(setup.IMPORT + '\n').startswith('{\n\t' + setup.ADMIN + '\n}\n'))
+        options = '# Mine\n{\n\temail a@b.c\n}\nimport x\n'
+        self.assertEqual(setup.private_admin(options), '# Mine\n{\n\t' + setup.ADMIN + '\n\temail a@b.c\n}\nimport x\n')
+        self.assertEqual(setup.private_admin(setup.private_admin(options)), setup.private_admin(options))
+        own = '{\n\tadmin localhost:3000\n}\n'
+        with patch('builtins.print'):
+            self.assertEqual(setup.private_admin(own), own)
+        # "admin" outside the global options says nothing about the admin API.
+        for main in ['site {\n\tbasicauth {\n\t\tadmin JDJh\n\t}\n}\n', 'admin.example.com {\n}\n', f'# {setup.ADMIN}\n{setup.IMPORT}\n', '{$DOMAIN:example.com} {\n}\n', 'import.example.com {\n}\n']:
+            self.assertTrue(setup.private_admin(main).startswith('{\n\t' + setup.ADMIN), main)
+        self.assertIn('\t' + setup.ADMIN + '\n', setup.private_admin('{ # mine\r\n\temail a@b.c\r\n}\r\nimport x\r\n'))
+        # A comment after the brace must not stretch the options block over later sites.
+        self.assertEqual(setup.private_admin('{ # opts\n\temail a@b.c\n}\nexample.com {\n\trespond hi\n}\n'),
+                         '{ # opts\n\t' + setup.ADMIN + '\n\temail a@b.c\n}\nexample.com {\n\trespond hi\n}\n')
+        commented = '{ # opts\n\tadmin localhost:3000\n}\nimport x\n'
+        with patch('builtins.print'):
+            self.assertEqual(setup.private_admin(commented), commented)
+        for main in ['(snippet) {\n}\n{\n\temail a@b.c\n}\n', '{ email a@b.c }\nimport x\n', 'import opts.caddy\n']:
+            with patch('builtins.print') as printed:
+                self.assertEqual(setup.private_admin(main), main)
+            self.assertIn('stays on TCP', printed.call_args[0][0])
+        self.assertIn('RuntimeDirectoryMode=0700', setup.caddy_boot({}))
+        dropin = setup.nftables_dropin('/usr/sbin/nft')
+        self.assertIn(f'ExecStartPost=/usr/sbin/nft -f {setup.FIREWALL}', dropin)
+        self.assertIn(f'ExecReload=/usr/sbin/nft -f {setup.FIREWALL}', dropin)
+
+    def test_old_addresses_stay_pinned_during_a_change(self):
+        tailscale = dict(interface='tailscale0', ip='100.70.0.5')
+        old = dict(https=True, bind='0.0.0.0', access='ips', extra=[tailscale])
+        moved = dict(old, extra=[dict(interface='wg0', ip='10.8.0.2')])
+        unpinned = dict(old, access='lan', lan='192.168.1.42', extra=[])
+        during = setup.firewall_text(moved, old)
+        self.assertIn('100.70.0.5', during)
+        self.assertIn('10.8.0.2', during)
+        self.assertNotIn('100.70.0.5', setup.firewall_text(moved))
+        self.assertEqual(setup.firewall_text(old, old), setup.firewall_text(old))
+        rewired = dict(old, extra=[dict(tailscale, interface='wg0')])
+        self.assertEqual(setup.firewall_text(rewired, old), setup.firewall_text(rewired))
+        for broken in [dict(old, extra=[dict(tailscale, interface='x" }\n')]), dict(old, tailscale_name='pc.tail1.ts.net', tailscale_ips=[])]:
+            self.assertEqual(setup.firewall_text(moved, broken), setup.firewall_text(moved))
+        self.assertIn('Requires=alps-firewall.service', setup.caddy_boot(unpinned, old))
+        self.assertNotIn('alps-firewall', setup.caddy_boot(unpinned))
+
+    def test_firewall_check_restores_the_rule_or_stops_caddy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bin_folder = Path(folder)
+            log = bin_folder / 'log'
+            (bin_folder / 'systemctl').write_text(f'#!/bin/sh\necho "systemctl $*" >> {log}\n')
+            (bin_folder / 'systemctl').chmod(0o755)
+            nft, script = bin_folder / 'nft', bin_folder / 'check'
+            # The fake systemctl must win: this test must never reach the real one.
+            text = setup.firewall_check(str(nft))
+            self.assertIn(setup.CHECK_PATH, text)
+            script.write_text(text.replace(setup.CHECK_PATH, f'PATH={bin_folder}:/usr/bin:/bin'))
+            script.chmod(0o755)
+
+            def check(listed, applied):
+                log.write_text('')
+                nft.write_text(f'#!/bin/sh\necho "nft $*" >> {log}\n[ "$1" = list ] && {{ [ {listed} = 0 ] && echo "  drop"; exit 0; }}\nexit {applied}\n')
+                nft.chmod(0o755)
+                result = subprocess.run([str(script)], capture_output=True, env={'PATH': f'{bin_folder}:/usr/bin:/bin'})
+                return result.returncode, log.read_text()
+
+            self.assertEqual(check(0, 0), (0, 'nft list chain inet alps input\n'))
+            code, calls = check(1, 0)
+            self.assertEqual(code, 0)
+            self.assertIn(f'nft -f {setup.FIREWALL}', calls)
+            self.assertNotIn('systemctl', calls)
+            code, calls = check(1, 1)
+            self.assertEqual(code, 1)
+            self.assertIn('systemctl stop caddy alps-firewall.service', calls)
+        self.assertNotIn('ufw', setup.firewall_check('/usr/sbin/nft'))
+        repair = setup.firewall_check('/usr/sbin/nft', True)
+        self.assertIn('/usr/lib/ufw/ufw-init start quiet', repair)
+        self.assertNotIn('ufw reload', repair)
+        self.assertLess(repair.index('stop caddy'), repair.index('ufw-init'))
+
+    def test_firewall_removal_waits_and_cleans_up(self):
+        config = dict(https=True, bind='0.0.0.0', access='lan', lan='192.168.1.42', address='192.168.1.42', extra=[])
+        with tempfile.TemporaryDirectory() as folder:
+            unit, dropin = Path(folder) / 'alps-firewall.service', Path(folder) / 'alps.conf'
+            with patch.object(setup, 'FIREWALL_UNIT', unit), patch.object(setup, 'NFTABLES_DROPIN', dropin), \
+                    patch.object(setup, 'CADDY_DROPIN', Path(folder) / 'none'), patch.object(setup, 'run') as run:
+                setup.configure_firewall(config)
+                setup.remove_firewall(config)
+                run.assert_not_called()
+                dropin.write_text('left behind')  # The unit was deleted by hand.
+                setup.remove_firewall(config)
+            commands = [call[0][0] for call in run.call_args_list]
+            self.assertTrue(any('rm' in args and str(dropin) in args for args in commands))
+            self.assertFalse(any('disable' in args for args in commands))
+            self.assertEqual(commands[-1][-1], 'daemon-reload')
+
+    def test_setup_follows_access_changes(self):
+        both = dict(https=True, bind='0.0.0.0', access='lan+ips', lan='192.168.1.42', address='192.168.1.42',
+                    extra=[dict(interface='tailscale0', ip='100.70.0.5')], tailscale_name='pc.tail1.ts.net', tailscale_ips=['100.70.0.5'])
+        only = dict(both, access='ips', lan='', address='100.70.0.5')
+        self.assertTrue(setup.narrowed(both, only))
+        self.assertFalse(setup.narrowed(only, both))
+        self.assertFalse(setup.narrowed(both, both))
+        self.assertFalse(setup.narrowed({}, only))
+        self.assertFalse(setup.narrowed(dict(https=True, bind='127.0.0.1', address='127.0.0.1'), only))
+        row = dict(slug='notebook', name='Notebook', port=18443, upstream='http://127.0.0.1:3000')
+        self.assertEqual(gateway.public_url(only, row), 'https://pc.tail1.ts.net:18443')
+        self.assertEqual(gateway.public_url(dict(only, tailscale_name=''), row), 'https://100.70.0.5:18443')
+        manual = dict(id='manual', name='Manual', url='http://192.168.1.2:9000')
+        with tempfile.TemporaryDirectory() as folder:
+            data = Path(folder)
+            (data / 'exposed.json').write_text(json.dumps([row]))
+            (data / 'apps.json').write_text(json.dumps([dict(id='proxy-notebook', name='Renamed', url='https://192.168.1.42:18443', proxy='notebook'), manual]))
+            setup.refresh_tiles(only, data)
+            tile, other = app.load_apps(data)
+        self.assertEqual((tile['name'], tile['url']), ('Renamed', 'https://pc.tail1.ts.net:18443'))
+        self.assertEqual(other, manual)
+
     def test_missing_caddy_exits_before_changing_settings(self):
         with patch('builtins.input', side_effect=['local', 'https', 'quit']), patch.object(setup.shutil, 'which', return_value=None):
             with self.assertRaisesRegex(SystemExit, 'No settings changed'):
