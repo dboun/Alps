@@ -552,7 +552,8 @@ class SetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             unit, dropin = Path(folder) / 'alps-firewall.service', Path(folder) / 'alps.conf'
             with patch.object(setup, 'FIREWALL_UNIT', unit), patch.object(setup, 'NFTABLES_DROPIN', dropin), \
-                    patch.object(setup, 'CADDY_DROPIN', Path(folder) / 'none'), patch.object(setup, 'run') as run:
+                    patch.object(setup, 'CADDY_DROPIN', Path(folder) / 'none'), patch.object(setup, 'CHECK_TIMER', Path(folder) / 'timer'), \
+                    patch.object(setup, 'run') as run:
                 setup.configure_firewall(config)
                 setup.remove_firewall(config)
                 run.assert_not_called()
